@@ -76,6 +76,11 @@ public final class AutoTune {
         // back further, because bright scenes (snow, beach, high-key) are often meant to be bright.
         float ev = (float) (Math.log(TARGET_MEDIAN / Math.max(p50, 0.004f)) / Math.log(2.0));
         ev *= ev > 0 ? 0.7f : 0.35f;
+        // A frame whose brightest parts are already bright is not underexposed, it is a dark
+        // scene (dusk, night, a stage). Brighten it only as far as its highlights have room.
+        float p99 = percentile(hist, n, 0.998);
+        float headroom = (float) (Math.log(1.0 / Math.max(p99, 0.004f)) / Math.log(2.0));
+        ev = Math.min(ev, headroom + 0.5f);
         ev = Params.clamp(ev, -1f, 2f);
         if (Math.abs(ev) < 0.15f) {
             ev = 0f;
@@ -88,9 +93,11 @@ public final class AutoTune {
         // When the photo is being darkened, bright areas are still judged as they were shot:
         // an overexposed frame needs its highlights pulled down as well.
         float bright = 1f - fractionBelow(hist, n, 0.70f / Math.max(gain, 1f));
-        // Lifted only modestly: large black areas are usually meant to be black.
-        p.shadows = round2(Params.clamp(dark * 1.2f, 0f, 0.35f));
-        p.highlights = round2(-Params.clamp(bright * 2.5f, 0f, 0.6f));
+        // These act by region (see LocalMap), so they can be firmer than a global curve without
+        // flattening the photo. Shadows stay the gentler of the two: large dark areas are often
+        // meant to be dark, and lifting them also lifts noise.
+        p.shadows = round2(Params.clamp(dark * 2.0f, 0f, 0.5f));
+        p.highlights = round2(-Params.clamp(bright * 2.0f, 0f, 0.6f));
 
         // Contrast from the spread between dark and bright tones, in stops.
         float spread = (float) (Math.log(Math.max(p95, 1e-4f) / Math.max(p5, 1e-4f)) / Math.log(2.0));
@@ -116,12 +123,11 @@ public final class AutoTune {
             }
         }
 
-        // Saturation: nudge only the extremes.
+        // Saturation: a small lift for washed-out photos only. Vivid photos are left to the look,
+        // which already tames the most intense colours.
         float meanPurity = (float) (sumPurity / n);
         if (meanPurity < 0.15f) {
             p.saturation = 0.15f;
-        } else if (meanPurity > 0.55f) {
-            p.saturation = -0.10f;
         }
         return p;
     }

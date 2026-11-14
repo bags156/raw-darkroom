@@ -76,7 +76,11 @@ public class PipelineTest {
     }
 
     @Test
-    public void toneCurveIsMonotonicAtEverySliderExtreme() {
+    public void greyRampStaysInOrderAtEverySliderExtreme() {
+        int[] ramp = new int[256];
+        for (int v = 0; v < 256; v++) {
+            ramp[v] = rgb(v, v, v);
+        }
         float[] ends = {-1f, 0f, 1f};
         float[] exposures = {-3f, 0f, 1.3f, 3f};
         for (float contrast : ends) {
@@ -90,19 +94,27 @@ public class PipelineTest {
                             p.highlights = highlights;
                             p.exposure = exposure;
                             p.look = look;
-                            double last = -1;
-                            for (int i = 0; i <= 2000; i++) {
-                                double y = i / 1000.0;
-                                double t = Pipeline.tone(y, p);
-                                assertTrue("in range", t >= 0.0 && t <= 1.0);
-                                assertTrue("monotonic at y=" + y + " c=" + contrast + " s=" + shadows
-                                        + " h=" + highlights + " e=" + exposure, t >= last - 1e-9);
-                                last = t;
+                            int[] out = run(p, ramp);
+                            for (int v = 1; v < 256; v++) {
+                                assertTrue("order at " + v + " c=" + contrast + " s=" + shadows
+                                        + " h=" + highlights + " e=" + exposure,
+                                        g(out[v]) >= g(out[v - 1]));
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    @Test
+    public void toneCurveStaysInRange() {
+        Params p = new Params();
+        p.contrast = 1f;
+        p.exposure = 3f;
+        for (int i = 0; i <= 2000; i++) {
+            double t = Pipeline.tone(i / 1000.0, p);
+            assertTrue(t >= 0.0 && t <= 1.0);
         }
     }
 

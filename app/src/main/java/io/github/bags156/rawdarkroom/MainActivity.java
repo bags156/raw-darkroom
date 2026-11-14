@@ -5,6 +5,7 @@ import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -28,6 +29,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -36,6 +38,7 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 
 import io.github.bags156.rawdarkroom.core.AutoTune;
+import io.github.bags156.rawdarkroom.core.LocalMap;
 import io.github.bags156.rawdarkroom.core.Params;
 import io.github.bags156.rawdarkroom.core.Pipeline;
 
@@ -51,8 +54,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * The whole app: pick photos, auto-tune each one on the device, adjust with sliders, export JPEG.
- * Nothing leaves the phone; the app has no Internet permission.
+ * The whole app. Photos arrive from the system picker or from another app's Share menu; each is
+ * analysed and developed on the device and, by default, saved straight away. Sliders are there
+ * for the photos that need a nudge, hidden until asked for. Nothing leaves the phone; the app has
+ * no Internet permission.
  */
 public class MainActivity extends Activity {
 
@@ -75,9 +80,11 @@ public class MainActivity extends Activity {
         final Uri uri;
         final String name;
         /** Null until the photo has been analysed. */
-        Params params;
+        volatile Params params;
+        /** Regional brightness of the photo as currently rotated. Null until analysed. */
+        volatile LocalMap map;
         /** Quarter turns clockwise, 0..3. */
-        int rotation;
+        volatile int rotation;
 
         Photo(Uri uri, String name) {
             this.uri = uri;
@@ -100,16 +107,23 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     /** Decoding, analysis and export, one job at a time. */
     private final ExecutorService work = Executors.newSingleThreadExecutor();
+    /** Preview rendering, kept separate so the screen stays live while photos are being saved. */
+    private final ExecutorService renderWork = Executors.newSingleThreadExecutor();
     /** Pixel crunching, spread across the cores. */
     private final int threads = Math.max(2, Runtime.getRuntime().availableProcessors() - 1);
     private final ExecutorService pool = Executors.newFixedThreadPool(threads);
     private final AtomicInteger loadGeneration = new AtomicInteger();
     private final AtomicInteger renderGeneration = new AtomicInteger();
-    /** Owned by the work thread. */
+    /** Owned by the render thread. */
     private int[] renderBuffer;
+
+    private static final String PREF_AUTO_SAVE = "auto_save";
 
     private ImageView image;
     private TextView status;
+    private CheckBox autoSave;
+    private View adjustPanel;
+    private SharedPreferences prefs;
     private final List<Button> buttons = new ArrayList<>();
     private final List<Slider> sliders = new ArrayList<>();
 
@@ -151,17 +165,17 @@ public class MainActivity extends Activity {
         status.setTextColor(Color.rgb(210, 210, 210));
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         status.setPadding(dp(12), dp(8), dp(12), dp(4));
-        status.setText("Tap Open and pick photos. RAW (DNG) files from Master Mode work best.");
+        status.setText("Tap Open, or share photos to this app from your gallery. "
+                + "RAW (DNG) files from Master Mode work best.");
         root.addView(status);
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         addButton(row, "Open", v -> openPicker());
-        addButton(row, "Auto", v -> autoTuneCurrent());
-        addButton(row, "Reset", v -> resetCurrent());
-        addButton(row, "Rotate", v -> rotateCurrent());
         addButton(row, "Prev", v -> show(index - 1));
         addButton(row, "Next", v -> show(index + 1));
+        addButton(row, "Adjust", v -> toggleAdjust());
+        addButton(row, "Rotate", v -> rotateCurrent());
         addButton(row, "Save", v -> exportCurrent());
         addButton(row, "Save all", v -> exportAll());
         HorizontalScrollView rowScroll = new HorizontalScrollView(this);
@@ -169,9 +183,26 @@ public class MainActivity extends Activity {
         rowScroll.addView(row);
         root.addView(rowScroll);
 
+        prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        autoSave = new CheckBox(this);
+        autoSave.setText("Save automatically when photos are opened");
+        autoSave.setTextColor(Color.rgb(210, 210, 210));
+        autoSave.setChecked(prefs.getBoolean(PREF_AUTO_SAVE, true));
+        autoSave.setOnCheckedChangeListener((button, checked) ->
+                prefs.edit().putBoolean(PREF_AUTO_SAVE, checked).apply());
+        LinearLayout.LayoutParams autoSaveLayout = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        autoSaveLayout.setMargins(dp(8), 0, dp(8), dp(4));
+        root.addView(autoSave, autoSaveLayout);
+
         LinearLayout sliderColumn = new LinearLayout(this);
         sliderColumn.setOrientation(LinearLayout.VERTICAL);
         sliderColumn.setPadding(dp(12), dp(4), dp(12), dp(8));
+        LinearLayout adjustRow = new LinearLayout(this);
+        adjustRow.setOrientation(LinearLayout.HORIZONTAL);
+        addButton(adjustRow, "Auto", v -> autoTuneCurrent());
+        addButton(adjustRow, "Reset", v -> resetCurrent());
+        sliderColumn.addView(adjustRow);
         addSlider(sliderColumn, "Look", 0f, 1f, p -> p.look, (p, v) -> p.look = v);
         addSlider(sliderColumn, "Exposure", -3f, 3f, p -> p.exposure, (p, v) -> p.exposure = v);
         addSlider(sliderColumn, "Contrast", -1f, 1f, p -> p.contrast, (p, v) -> p.contrast = v);
@@ -182,17 +213,61 @@ public class MainActivity extends Activity {
         addSlider(sliderColumn, "Saturation", -1f, 1f, p -> p.saturation, (p, v) -> p.saturation = v);
         ScrollView sliderScroll = new ScrollView(this);
         sliderScroll.addView(sliderColumn);
+        sliderScroll.setVisibility(View.GONE);
+        adjustPanel = sliderScroll;
         root.addView(sliderScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(230)));
 
         setContentView(root);
         updateEnabled();
+        if (savedInstanceState == null) {
+            handleShare(getIntent());
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleShare(intent);
+    }
+
+    /** Photos sent from another app's Share menu. */
+    @SuppressWarnings("deprecation") // The typed getParcelableExtra overloads need API 33.
+    private void handleShare(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        List<Uri> uris = new ArrayList<>();
+        String action = intent.getAction();
+        if (Intent.ACTION_SEND.equals(action)) {
+            Uri u = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (u != null) {
+                uris.add(u);
+            }
+        } else if (Intent.ACTION_SEND_MULTIPLE.equals(action)) {
+            ArrayList<Uri> list = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            if (list != null) {
+                for (Uri u : list) {
+                    if (u != null) {
+                        uris.add(u);
+                    }
+                }
+            }
+        }
+        loadPhotos(uris);
+    }
+
+    private void toggleAdjust() {
+        adjustPanel.setVisibility(
+                adjustPanel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         work.shutdownNow();
+        renderWork.shutdownNow();
         pool.shutdownNow();
     }
 
@@ -359,7 +434,16 @@ public class MainActivity extends Activity {
         } else if (data.getData() != null) {
             uris.add(data.getData());
         }
+        loadPhotos(uris);
+    }
+
+    /** Replaces the current set of photos, shows the first and, if enabled, saves them all. */
+    private void loadPhotos(List<Uri> uris) {
         if (uris.isEmpty()) {
+            return;
+        }
+        if (busy) {
+            setStatus("Still saving the previous photos. Try again when that finishes.");
             return;
         }
         photos.clear();
@@ -367,6 +451,9 @@ public class MainActivity extends Activity {
             photos.add(new Photo(u, displayName(u)));
         }
         show(0);
+        if (autoSave.isChecked()) {
+            exportAll();
+        }
     }
 
     private String displayName(Uri uri) {
@@ -404,12 +491,16 @@ public class MainActivity extends Activity {
                 bmp.getPixels(px, 0, w, 0, 0, w, h);
                 final Params tuned = photo.params != null
                         ? null : AutoTune.analyze(px, w, h, Params.DEFAULT_LOOK);
+                final LocalMap map = photo.map != null ? photo.map : LocalMap.build(px, w, h);
                 ui.post(() -> {
-                    if (generation != loadGeneration.get()) {
-                        return;
-                    }
                     if (photo.params == null) {
                         photo.params = tuned;
+                    }
+                    if (photo.map == null) {
+                        photo.map = map;
+                    }
+                    if (generation != loadGeneration.get()) {
+                        return;
                     }
                     previewPixels = px;
                     previewW = w;
@@ -418,7 +509,9 @@ public class MainActivity extends Activity {
                     editedPreview = null;
                     image.setImageBitmap(bmp);
                     loadSliders(photo.params);
-                    setStatus(position());
+                    if (!busy) {
+                        setStatus(position());
+                    }
                     updateEnabled();
                     render();
                 });
@@ -521,6 +614,7 @@ public class MainActivity extends Activity {
             return;
         }
         photo.rotation = (photo.rotation + 1) % 4;
+        photo.map = null;
         show(index);
     }
 
@@ -532,10 +626,11 @@ public class MainActivity extends Activity {
             return;
         }
         final Params params = photo.params.copy();
+        final LocalMap map = photo.map;
         final int w = previewW;
         final int h = previewH;
         final int generation = renderGeneration.incrementAndGet();
-        work.execute(() -> {
+        renderWork.execute(() -> {
             if (generation != renderGeneration.get()) {
                 return;
             }
@@ -543,7 +638,7 @@ public class MainActivity extends Activity {
                 if (renderBuffer == null || renderBuffer.length != src.length) {
                     renderBuffer = new int[src.length];
                 }
-                processParallel(new Pipeline(params), src, renderBuffer);
+                processParallel(new Pipeline(params), src, renderBuffer, w, h, map);
                 final Bitmap out = Bitmap.createBitmap(renderBuffer, w, h, Bitmap.Config.ARGB_8888);
                 ui.post(() -> {
                     if (generation == renderGeneration.get()) {
@@ -559,16 +654,15 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void processParallel(Pipeline pipeline, int[] in, int[] out)
+    private void processParallel(Pipeline pipeline, int[] in, int[] out, int w, int h, LocalMap map)
             throws InterruptedException {
-        int n = in.length;
-        int chunk = Math.max(1, (n + threads - 1) / threads);
+        int rowsPerJob = Math.max(1, (h + threads - 1) / threads);
         List<Callable<Void>> jobs = new ArrayList<>();
-        for (int start = 0; start < n; start += chunk) {
-            final int from = start;
-            final int count = Math.min(chunk, n - start);
+        for (int y = 0; y < h; y += rowsPerJob) {
+            final int from = y;
+            final int rows = Math.min(rowsPerJob, h - y);
             jobs.add(() -> {
-                pipeline.process(in, out, from, count);
+                pipeline.processRows(in, out, from * w, w, rows, from, h, map);
                 return null;
             });
         }
@@ -627,27 +721,38 @@ public class MainActivity extends Activity {
 
     /** Runs on the work thread. */
     private void exportOne(Photo photo) throws IOException, InterruptedException {
+        final int rotation = photo.rotation;
         Params params = photo.params;
-        if (params == null) {
+        LocalMap map = photo.map;
+        if (params == null || map == null) {
             // Not viewed yet: analyse a preview-sized copy, exactly as the screen would have.
-            Bitmap small = decode(photo.uri, PREVIEW_SIZE, photo.rotation);
+            Bitmap small = decode(photo.uri, PREVIEW_SIZE, rotation);
             int w = small.getWidth();
             int h = small.getHeight();
             int[] px = new int[w * h];
             small.getPixels(px, 0, w, 0, 0, w, h);
             small.recycle();
-            params = AutoTune.analyze(px, w, h, Params.DEFAULT_LOOK);
+            if (params == null) {
+                params = AutoTune.analyze(px, w, h, Params.DEFAULT_LOOK);
+            }
+            if (map == null) {
+                map = LocalMap.build(px, w, h);
+            }
             final Params tuned = params;
+            final LocalMap built = map;
             ui.post(() -> {
                 if (photo.params == null) {
                     photo.params = tuned;
                 }
+                if (photo.map == null && photo.rotation == rotation) {
+                    photo.map = built;
+                }
             });
         }
 
-        final Bitmap full = decode(photo.uri, 0, photo.rotation);
+        final Bitmap full = decode(photo.uri, 0, rotation);
         try {
-            processBitmap(full, new Pipeline(params.copy()));
+            processBitmap(full, new Pipeline(params.copy()), map);
             save(full, photo);
         } finally {
             full.recycle();
@@ -655,7 +760,8 @@ public class MainActivity extends Activity {
     }
 
     /** Processes a bitmap in place, in horizontal bands, to keep extra memory small. */
-    private void processBitmap(final Bitmap bmp, final Pipeline pipeline) throws InterruptedException {
+    private void processBitmap(final Bitmap bmp, final Pipeline pipeline, final LocalMap map)
+            throws InterruptedException {
         final int w = bmp.getWidth();
         final int h = bmp.getHeight();
         final int bandRows = Math.max(1, Math.min(h, (1 << 20) / Math.max(1, w)));
@@ -673,7 +779,7 @@ public class MainActivity extends Activity {
                     synchronized (bmp) {
                         bmp.getPixels(band, 0, w, 0, y, w, rows);
                     }
-                    pipeline.process(band, band, 0, w * rows);
+                    pipeline.processRows(band, band, 0, w, rows, y, h, map);
                     synchronized (bmp) {
                         bmp.setPixels(band, 0, w, 0, y, w, rows);
                     }

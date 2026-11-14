@@ -49,6 +49,17 @@ public class AutoTuneTest {
     }
 
     @Test
+    public void darkSceneWithBrightLightsIsNotTreatedAsUnderexposed() {
+        // Mostly dark, but with lamps at full brightness: dusk, not a mistake.
+        int[] px = scene(0.12, 1, 1);
+        for (int i = 0; i < px.length; i += 40) {
+            px[i] = 0xFFFFFFFF;
+        }
+        Params p = AutoTune.analyze(px, W, H, 0.7f);
+        assertTrue("exposure " + p.exposure, p.exposure <= 0.6f);
+    }
+
+    @Test
     public void overexposedSceneIsDarkenedOnlyGently() {
         Params p = AutoTune.analyze(scene(2.5, 1, 1), W, H, 0.7f);
         assertTrue("exposure " + p.exposure, p.exposure < 0f);
