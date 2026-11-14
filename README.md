@@ -54,12 +54,16 @@ file, runs in milliseconds, and its decisions are explainable (`core/AutoTune.ja
 
 ## Install
 
-1. Open the repository's **Actions → Build Android APK** workflow.
-2. Open a successful run and download the **Raw-Darkroom-debug** artifact.
-3. Unzip it, copy `app-debug.apk` to the phone and open it. Allow installation from that source
-   if Android asks.
+**With Obtainium:** add `https://github.com/bags156/raw-darkroom` as an app source. Each release
+carries a signed APK, so updates install in place. While the repository is private, Obtainium
+needs a GitHub personal access token (Settings → GitHub) that can read it.
+
+**By hand:** open the repository's **Releases** page, download `Raw-Darkroom-vX.Y.Z.apk` from the
+latest release and open it on the phone. Allow installation from that source if Android asks.
 
 Every build is signed with the public key in `signing/`, so a new build installs over the old one.
+
+To publish a new release, change `version.txt` (for example to `0.2.0`) and push to `main`.
 
 ## Known limits
 
